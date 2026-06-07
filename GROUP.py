@@ -1,120 +1,30 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.neural_network import MLPRegressor, MLPClassifier
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.inspection import permutation_importance
-from sklearn.metrics import mean_absolute_error, accuracy_score
+from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, Input
+from tensorflow.keras.callbacks import EarlyStopping
 import shap
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import avg, count, when, col
+from pyspark.ml.feature import VectorAssembler, StandardScaler as SparkScaler
+from pyspark.ml.classification import RandomForestClassifier, MultilayerPerceptronClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+import tempfile
+import os
 
-# -------------------------------
-# Page configuration
+# ------------------------------------------------------------
+# Page config
 st.set_page_config(page_title="AI Product Feature Prioritisation", layout="wide")
-st.title("🚚 AI Product Feature Prioritisation Using Customer & IoT Data")
+st.title("🚚 AI Product Feature Prioritisation (Exact Colab Replica)")
 
-# -------------------------------
-# Helper: Customer data preprocessing
-@st.cache_data
-def preprocess_customer(df):
-    # Drop rows with missing target or numerical cols
-    num_cols = ['DeliveryTimemin', 'CustomerServiceRating']
-    target = 'Rating'
-    df = df.dropna(subset=num_cols + [target])
-    
-    cat_cols = ['AgentName', 'Location', 'OrderType', 'CustomerFeedbackType',
-                'PriceRange', 'ProductAvailability', 'OrderAccuracy', 'DiscountApplied']
-    
-    # One-hot encode categoricals
-    df_enc = pd.get_dummies(df, columns=cat_cols, drop_first=True)
-    
-    # Drop ReviewText (free text) and keep target
-    X = df_enc.drop(columns=[target, 'ReviewText'], errors='ignore')
-    y = df_enc[target].values
-    
-    # Split and scale
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    
-    return X_train_scaled, X_test_scaled, y_train, y_test, X.columns, scaler
-
-# -------------------------------
-# Helper: IoT data preprocessing
-@st.cache_data
-def preprocess_iot(df):
-    # Keep only required features + target 'Logistics_Delay'
-    # Use columns similar to notebook: Temperature, Humidity, Asset_Utilization, Waiting_Time
-    # If Asset_Utilization missing, derive from Inventory_Level (example logic)
-    if 'Asset_Utilization' not in df.columns:
-        # Assume Inventory_Level as proxy (scaled)
-        df['Asset_Utilization'] = df['Inventory_Level'] / 100.0 if 'Inventory_Level' in df.columns else 0.5
-    if 'Waiting_Time' not in df.columns and 'Waiting' in df.columns:
-        df['Waiting_Time'] = df['Waiting']
-    elif 'Waiting_Time' not in df.columns:
-        df['Waiting_Time'] = 0.0
-    
-    feature_cols = ['Temperature', 'Humidity', 'Asset_Utilization', 'Waiting_Time']
-    # Drop rows with missing values in features or target
-    df = df.dropna(subset=feature_cols + ['Logistics_Delay'])
-    
-    X = df[feature_cols].copy()
-    y = df['Logistics_Delay'].astype(int)   # binary (0/1)
-    
-    # Scale features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
-    return X_train, X_test, y_train, y_test, feature_cols, scaler
-
-# -------------------------------
-# Train regression model (Rating)
-@st.cache_resource
-def train_regression_model(X_train, y_train):
-    model = MLPRegressor(hidden_layer_sizes=(128, 64, 32), activation='relu',
-                        alpha=0.001, max_iter=200, early_stopping=True,
-                        validation_fraction=0.2, random_state=42)
-    model.fit(X_train, y_train)
-    return model
-
-# -------------------------------
-# Train classification model (Logistics Delay)
-@st.cache_resource
-def train_classification_model(X_train, y_train):
-    model = MLPClassifier(hidden_layer_sizes=(64, 32), activation='relu',
-                        max_iter=200, early_stopping=True,
-                        validation_fraction=0.2, random_state=42)
-    model.fit(X_train, y_train)
-    return model
-
-# -------------------------------
-# Permutation importance (faster than SHAP for deployment)
-def get_feature_importance(model, X_test, y_test, feature_names, task='regression'):
-    scoring = 'neg_mean_absolute_error' if task == 'regression' else 'accuracy'
-    result = permutation_importance(model, X_test, y_test, n_repeats=5,
-                                    random_state=42, scoring=scoring)
-    importance = result.importances_mean
-    df_imp = pd.DataFrame({'feature': feature_names, 'importance': importance})
-    return df_imp.sort_values('importance', ascending=False)
-
-# -------------------------------
-# Sidebar – file uploads
-st.sidebar.header("📂 Upload CSV Files")
-cust_file = st.sidebar.file_uploader("Customer Survey (Fast Delivery Agent Reviews.csv)", type="csv")
-iot_file = st.sidebar.file_uploader("IoT Logistics Dataset (smart_logistics_dataset.csv)", type="csv")
-
-if not cust_file or not iot_file:
-    st.info("Please upload both CSV files to start the analysis.")
-    st.stop()
-
-# -------------------------------
-# Load data
+# ------------------------------------------------------------
+# Helper: Cache data loading
 @st.cache_data
 def load_customer(file):
     return pd.read_csv(file)
@@ -123,123 +33,199 @@ def load_customer(file):
 def load_iot(file):
     return pd.read_csv(file)
 
+# ------------------------------------------------------------
+# Sidebar uploads
+st.sidebar.header("📂 Upload CSV Files")
+cust_file = st.sidebar.file_uploader("Customer Survey (Fast Delivery Agent Reviews.csv)", type="csv")
+iot_file = st.sidebar.file_uploader("IoT Dataset (smart_logistics_dataset.csv)", type="csv")
+
+if not cust_file or not iot_file:
+    st.info("Please upload both CSV files to start the analysis.")
+    st.stop()
+
+# ------------------------------------------------------------
+# Load data
 df_cust = load_customer(cust_file)
 df_iot = load_iot(iot_file)
-
 st.success("✅ Files loaded successfully!")
 
-# -------------------------------
-# CUSTOMER ANALYSIS (Product feature prioritisation)
-st.header("📊 1. Customer Survey Analysis – Rating Prediction")
+# ------------------------------------------------------------
+# 1. CUSTOMER ANALYSIS (TensorFlow DNN + SHAP) – exactly as Colab
+st.header("📊 1. Customer Survey Analysis – Rating Prediction (TensorFlow DNN)")
 
-with st.spinner("Preprocessing customer data..."):
-    X_tr_c, X_te_c, y_tr_c, y_te_c, cust_features, scaler_c = preprocess_customer(df_cust)
+# Preprocessing (identical to Colab)
+cat_cols = ['AgentName', 'Location', 'OrderType', 'CustomerFeedbackType', 
+            'PriceRange', 'ProductAvailability', 'OrderAccuracy', 'DiscountApplied']
+num_cols = ['DeliveryTimemin', 'CustomerServiceRating']
+target = 'Rating'
 
-st.write(f"**Data shape** – Training: {X_tr_c.shape}, Test: {X_te_c.shape}")
+df_cust = df_cust.dropna(subset=num_cols + [target])
+df_enc = pd.get_dummies(df_cust, columns=cat_cols, drop_first=True)
+X = df_enc.drop(columns=[target, 'ReviewText'], errors='ignore')
+y = df_enc[target].values
 
-if st.button("🚀 Train Regression Model (Rating)"):
-    with st.spinner("Training neural network..."):
-        reg_model = train_regression_model(X_tr_c, y_tr_c)
-        y_pred = reg_model.predict(X_te_c)
-        mae = mean_absolute_error(y_te_c, y_pred)
-        st.metric("Test MAE (Rating)", f"{mae:.3f}")
-    
-    # Feature importance (permutation)
-    with st.spinner("Computing feature importance..."):
-        imp_df = get_feature_importance(reg_model, X_te_c, y_te_c, cust_features, task='regression')
-    
-    st.subheader("🏆 Feature Priority (Product Feature Prioritisation)")
-    st.dataframe(imp_df, use_container_width=True)
-    
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+scaler = StandardScaler()
+X_train_s = scaler.fit_transform(X_train)
+X_test_s = scaler.transform(X_test)
+
+feature_names = X.columns.tolist()
+
+# Train DNN (exact architecture from Colab)
+@st.cache_resource
+def train_dnn(X_train_s, y_train):
+    model = Sequential([
+        Input(shape=(X_train_s.shape[1],)),
+        Dense(128, activation='relu'),
+        Dropout(0.3),
+        Dense(64, activation='relu'),
+        Dropout(0.2),
+        Dense(32, activation='relu'),
+        Dense(1, activation='linear')
+    ])
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model.fit(X_train_s, y_train, validation_split=0.2, epochs=100, batch_size=32,
+              callbacks=[early_stop], verbose=0)
+    return model
+
+if st.button("🚀 Train Rating Model (TensorFlow DNN)"):
+    with st.spinner("Training Deep Neural Network..."):
+        model = train_dnn(X_train_s, y_train)
+        test_loss, test_mae = model.evaluate(X_test_s, y_test, verbose=0)
+        st.metric("Test MAE (Rating)", f"{test_mae:.3f}")
+        st.caption(f"(Expected ~1.022 as in Colab)")
+
+    # SHAP feature importance (identical to Colab)
+    with st.spinner("Computing SHAP feature importance..."):
+        background = X_train_s[np.random.choice(X_train_s.shape[0], 100, replace=False)]
+        explainer = shap.Explainer(model, background)
+        shap_values = explainer(X_test_s[:100])
+        mean_shap = np.abs(shap_values.values).mean(axis=0)
+        feat_imp = pd.DataFrame({'feature': feature_names, 'importance': mean_shap})
+        feat_imp = feat_imp.sort_values('importance', ascending=False)
+
+    st.subheader("🏆 Feature Priority (Product Prioritisation)")
+    st.dataframe(feat_imp, use_container_width=True)
+
     # Plot top 10
-    fig, ax = plt.subplots(figsize=(10, 6))
-    top10 = imp_df.head(10)
+    fig, ax = plt.subplots(figsize=(10,6))
+    top10 = feat_imp.head(10)
     sns.barplot(data=top10, x='importance', y='feature', palette='viridis', ax=ax)
-    ax.set_title("Top 10 Features Influencing Customer Rating")
-    ax.set_xlabel("Permutation Importance (Δ MAE)")
+    ax.set_title("Top 10 Features Influencing Customer Rating (SHAP)")
     st.pyplot(fig)
-    
-    # Download button
-    csv = imp_df.to_csv(index=False)
-    st.download_button("📥 Download Customer Feature Priority", csv, "customer_feature_priority.csv", "text/csv")
-    
-    # Optional SHAP summary (sample for explanation)
-    if st.checkbox("Show SHAP summary (may take a few seconds)"):
-        with st.spinner("Computing SHAP values..."):
-            explainer = shap.KernelExplainer(reg_model.predict, X_tr_c[:100])
-            shap_values = explainer.shap_values(X_te_c[:50])
-            fig_shap = plt.figure()
-            shap.summary_plot(shap_values, X_te_c[:50], feature_names=cust_features, show=False)
-            st.pyplot(fig_shap)
-    
-    # --- Interactive prediction widget ---
-    st.subheader("🔮 Predict Rating for a New Customer")
-    with st.form("customer_form"):
-        cols = st.columns(4)
-        input_values = {}
-        for i, feat in enumerate(cust_features):
-            with cols[i % 4]:
-                input_values[feat] = st.number_input(feat, value=0.0, step=0.1, format="%.2f")
-        submitted = st.form_submit_button("Predict Rating")
-        if submitted:
-            input_df = pd.DataFrame([input_values])
-            input_scaled = scaler_c.transform(input_df)
-            pred_rating = reg_model.predict(input_scaled)[0]
-            st.success(f"⭐ Predicted Rating: {pred_rating:.2f} / 5.0")
 
-# -------------------------------
-# IOT ANALYSIS
-st.header("📡 2. IoT Logistics Analysis – Delay Prediction")
+    # Download CSV
+    csv_data = feat_imp.to_csv(index=False)
+    st.download_button("📥 Download Customer Feature Priority", csv_data,
+                       "feature_priority.csv", "text/csv")
 
-with st.spinner("Preprocessing IoT data..."):
-    X_tr_i, X_te_i, y_tr_i, y_te_i, iot_features, scaler_i = preprocess_iot(df_iot)
+# ------------------------------------------------------------
+# 2. IoT ANALYSIS (PySpark – exactly as Colab)
+st.header("📡 2. IoT Logistics Analysis – Delay Prediction (PySpark MLP + RF)")
 
-st.write(f"**Data shape** – Training: {X_tr_i.shape}, Test: {X_te_i.shape}")
+# Need to save uploaded file to disk for Spark to read (Spark cannot read from memory)
+@st.cache_data
+def save_uploaded_file(uploaded_file):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+        tmp.write(uploaded_file.getvalue())
+        return tmp.name
 
-if st.button("🚀 Train Classification Model (Logistics Delay)"):
-    with st.spinner("Training MLP classifier..."):
-        clf_model = train_classification_model(X_tr_i, y_tr_i)
-        y_pred_i = clf_model.predict(X_te_i)
-        acc = accuracy_score(y_te_i, y_pred_i)
-        st.metric("Test Accuracy (Delay Prediction)", f"{acc:.4f}")
-    
-    # Feature importance (Random Forest for comparison with original notebook)
-    with st.spinner("Computing feature importance via Random Forest..."):
-        rf = RandomForestClassifier(n_estimators=50, random_state=42)
-        rf.fit(X_tr_i, y_tr_i)
-        imp_rf = pd.DataFrame({'feature': iot_features, 'importance': rf.feature_importances_})
-        imp_rf = imp_rf.sort_values('importance', ascending=False)
-    
-    st.subheader("🏆 IoT Feature Priority (Top factors causing delays)")
-    st.dataframe(imp_rf, use_container_width=True)
-    
-    fig2, ax2 = plt.subplots()
-    sns.barplot(data=imp_rf, x='importance', y='feature', palette='rocket', ax=ax2)
-    ax2.set_title("IoT Feature Importance for Logistics Delay")
-    st.pyplot(fig2)
-    
-    # Download
-    csv_iot = imp_rf.to_csv(index=False)
-    st.download_button("📥 Download IoT Feature Priority", csv_iot, "iot_feature_priority.csv", "text/csv")
-    
-    # --- Interactive prediction for IoT ---
-    st.subheader("📦 Predict Delay Probability for a New Shipment")
-    with st.form("iot_form"):
-        i_cols = st.columns(4)
-        i_vals = {}
-        for i, feat in enumerate(iot_features):
-            with i_cols[i % 4]:
-                i_vals[feat] = st.number_input(feat, value=0.0, step=0.1, format="%.2f")
-        i_submit = st.form_submit_button("Predict Delay")
-        if i_submit:
-            i_input = pd.DataFrame([i_vals])
-            i_input_scaled = scaler_i.transform(i_input)
-            delay_pred = clf_model.predict(i_input_scaled)[0]
-            proba = clf_model.predict_proba(i_input_scaled)[0][1] if hasattr(clf_model, "predict_proba") else None
-            if proba is not None:
-                st.success(f"🚦 Delay predicted: {'YES' if delay_pred==1 else 'NO'} (probability: {proba:.2f})")
-            else:
-                st.success(f"🚦 Delay predicted: {'YES' if delay_pred==1 else 'NO'}")
+iot_path = save_uploaded_file(iot_file)
 
-st.sidebar.markdown("---")
-st.sidebar.info("Built with Streamlit, scikit-learn, SHAP. Prioritise features that most impact customer rating and logistics delays.")
+# Initialize Spark session (with proper configuration for Streamlit)
+@st.cache_resource
+def get_spark_session():
+    return SparkSession.builder \
+        .appName("IoT_logistics") \
+        .config("spark.driver.memory", "2g") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+        .getOrCreate()
+
+spark = get_spark_session()
+
+if st.button("🚀 Run IoT Analysis (PySpark DNN + RandomForest)"):
+    with st.spinner("Loading IoT data with Spark..."):
+        df_iot_spark = spark.read.option("header", True).option("inferSchema", True).csv(iot_path)
+        st.write(f"Rows: {df_iot_spark.count()}, Columns: {len(df_iot_spark.columns)}")
+
+        # Show raw data preview
+        st.subheader("Raw IoT Data Preview")
+        st.dataframe(df_iot_spark.limit(5).toPandas())
+
+        # --- IoT Analysis (exact from Colab) ---
+        # Temperature bin analysis
+        temp_delay = df_iot_spark.withColumn(
+            "TempBin",
+            when(col("Temperature") < 20, "20C")
+            .when((col("Temperature") >= 20) & (col("Temperature") < 30), "20-30C")
+            .otherwise("30C")
+        ).groupBy("TempBin").agg(avg("Logistics_Delay").alias("delay_rate"))
+        
+        # Traffic impact
+        traffic_impact = df_iot_spark.groupBy("Traffic_Status").agg(
+            avg("Logistics_Delay").alias("delay_rate"),
+            count("*").alias("count")
+        )
+
+        st.subheader("Analysis: Delay Rate by Temperature Bin")
+        st.dataframe(temp_delay.toPandas())
+        st.subheader("Analysis: Delay Rate by Traffic Status")
+        st.dataframe(traffic_impact.toPandas())
+
+        # Feature Engineering for ML
+        feature_cols = ['Temperature', 'Humidity', 'Asset_Utilization', 'Waiting_Time']
+        # Ensure Waiting_Time column exists (use 'Waiting' if present)
+        if 'Waiting_Time' not in df_iot_spark.columns and 'Waiting' in df_iot_spark.columns:
+            df_iot_spark = df_iot_spark.withColumnRenamed('Waiting', 'Waiting_Time')
+        
+        assembler = VectorAssembler(inputCols=feature_cols, outputCol="features_raw")
+        df_assembled = assembler.transform(df_iot_spark).select("features_raw", "Logistics_Delay")
+        scaler_ml = SparkScaler(inputCol="features_raw", outputCol="features", withStd=True, withMean=True)
+        df_scaled = scaler_ml.fit(df_assembled).transform(df_assembled)
+        train, test = df_scaled.randomSplit([0.8, 0.2], seed=42)
+
+        # DNN (MLP) on IoT data – same layers as Colab: [4, 8, 5, 2]
+        mlp = MultilayerPerceptronClassifier(
+            layers=[len(feature_cols), 8, 5, 2],
+            labelCol="Logistics_Delay",
+            featuresCol="features",
+            maxIter=50,
+            seed=123
+        )
+        with st.spinner("Training MLP classifier on IoT data..."):
+            mlp_model = mlp.fit(train)
+            pred = mlp_model.transform(test)
+            evaluator = MulticlassClassificationEvaluator(labelCol="Logistics_Delay", metricName="accuracy")
+            acc = evaluator.evaluate(pred)
+            st.metric("IoT DNN Accuracy", f"{acc:.4f}")
+            st.caption(f"(Expected ~0.5617 as in Colab)")
+
+        # Feature Importance via RandomForest (same as Colab)
+        rf = RandomForestClassifier(labelCol="Logistics_Delay", featuresCol="features", numTrees=50)
+        rf_model = rf.fit(train)
+        imp = rf_model.featureImportances.toArray()
+        iot_imp = pd.DataFrame({'feature': feature_cols, 'importance': imp})
+        iot_imp = iot_imp.sort_values('importance', ascending=False)
+
+        st.subheader("🏆 IoT Feature Priority (RandomForest)")
+        st.dataframe(iot_imp, use_container_width=True)
+
+        # Plot
+        fig2, ax2 = plt.subplots()
+        sns.barplot(data=iot_imp, x='importance', y='feature', palette='rocket', ax=ax2)
+        ax2.set_title("IoT Feature Importance for Logistics Delay")
+        st.pyplot(fig2)
+
+        # Download
+        csv_iot = iot_imp.to_csv(index=False)
+        st.download_button("📥 Download IoT Feature Priority", csv_iot,
+                           "iot_feature_priority.csv", "text/csv")
+
+    # Stop Spark session to free resources (optional)
+    spark.stop()
+    st.success("Analysis complete! You can now download the CSVs.")
+
+# Cleanup temp file
+if os.path.exists(iot_path):
+    os.unlink(iot_path)
